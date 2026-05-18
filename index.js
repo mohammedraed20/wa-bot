@@ -1,5 +1,4 @@
 // wa-bot/index.js — Railway
-// Fix: crypto is not defined on some Node.js environments
 if (typeof globalThis.crypto === 'undefined') {
   globalThis.crypto = require('crypto').webcrypto;
 }
@@ -15,7 +14,8 @@ const path    = require('path');
 const PORT       = process.env.PORT      || 3001;
 const PHP_CHAT   = process.env.PHP_CHAT  || '';
 const SECRET_KEY = process.env.WA_SECRET || 'wa_secret_2025';
-const AUTH_DIR   = path.join(__dirname, 'auth_info');
+// AUTH_DIR: use Railway Volume path if set, otherwise local (lost on restart)
+const AUTH_DIR   = process.env.AUTH_DIR  || path.join(__dirname, 'auth_info');
 
 let currentQR   = null;
 let isConnected = false;
@@ -45,14 +45,13 @@ app.get('/status', authMW, (req, res) => {
 app.get('/qr', authMW, (req, res) => {
   if (isConnected) return res.json({ connected:true, qr:null });
   if (!currentQR) {
-    // QR غير جاهز — حاول إعادة الاتصال
     if (!connecting) connect();
     return res.json({ connected:false, qr:null, waiting:true });
   }
   res.json({ connected:false, qr:currentQR });
 });
 
-// Logout + reconnect لتوليد QR جديد
+// Logout + reconnect
 app.post('/logout', authMW, async (req, res) => {
   console.log('[Bot] Logout requested');
   isConnected = false; currentQR = null; phoneNum = '';
@@ -63,14 +62,11 @@ app.post('/logout', authMW, async (req, res) => {
     waSocket = null;
   }
 
-  // احذف auth_info
   if (fs.existsSync(AUTH_DIR)) {
     fs.rmSync(AUTH_DIR, { recursive:true, force:true });
   }
 
   res.json({ ok:true });
-
-  // أعد الاتصال بعد ثانية لتوليد QR جديد
   setTimeout(connect, 1000);
 });
 
@@ -92,7 +88,7 @@ app.listen(PORT, () => console.log(`[Bot] Port ${PORT}`));
 async function connect() {
   if (connecting) return;
   connecting = true;
-  console.log('[Bot] Connecting...');
+  console.log('[Bot] Connecting... AUTH_DIR:', AUTH_DIR);
 
   try {
     if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive:true });
@@ -126,12 +122,10 @@ async function connect() {
         console.log(`[Bot] Disconnected. Code: ${code}`);
 
         if (code === DisconnectReason.loggedOut) {
-          // حذف auth ثم إعادة الاتصال لتوليد QR
           if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive:true, force:true });
           console.log('[Bot] Logged out — regenerating QR...');
           setTimeout(connect, 2000);
         } else if (code !== 401) {
-          // إعادة محاولة الاتصال
           console.log('[Bot] Reconnecting in 5s...');
           setTimeout(connect, 5000);
         }
@@ -154,44 +148,50 @@ async function connect() {
         if (msg.key.fromMe) continue;
         if (msg.key.remoteJid === 'status@broadcast') continue;
         if (msg.key.remoteJid?.endsWith('@g.us')) continue;
+        if (msg.key.remoteJid?.endsWith('@newsletter')) continue; // تجاهل القنوات
 
-        const from  = msg.key.remoteJid;
-        const phone = from?.replace('@s.whatsapp.net','') || '';
-        const text  = msg.message?.conversation
-                   || msg.message?.extendedTextMessage?.text
-                   || msg.message?.imageMessage?.caption
-                   || '';
+        const from     = msg.key.remoteJid;
+        const phone    = from?.replace('@s.whatsapp.net','') || '';
+        const pushName = msg.pushName || phone;
+        const text     = msg.message?.conversation
+                      || msg.message?.extendedTextMessage?.text
+                      || msg.message?.imageMessage?.caption
+                      || '';
 
         if (!text?.trim() || !PHP_CHAT) continue;
-        console.log(`[Bot] ${phone}: ${text.substring(0,50)}`);
+        console.log(`[Bot] ${phone} (${pushName}): ${text.substring(0,50)}`);
 
-        if (!sessions[phone]) sessions[phone] = { history:[], conv_id:'' };
+        if (!sessions[phone]) sessions[phone] = { conv_id:'' };
         const sess = sessions[phone];
 
         try { await waSocket.sendPresenceUpdate('composing', from); } catch(e){}
 
         try {
           const r = await axios.post(PHP_CHAT, {
-            message:      text,
-            history:      sess.history.slice(-6),
-            conv_id:      sess.conv_id,
-            source:       'whatsapp',
-            visitor_name: phone,
-          }, { timeout:30000 });
+            message: text,
+            phone:   phone,       // ✅ رقم العميل
+            name:    pushName,    // ✅ اسم العميل
+            source:  'whatsapp',
+            conv_id: sess.conv_id,
+            id:      msg.key.id,  // ✅ deduplication
+          }, {
+            timeout: 35000,
+            headers: {
+              'Content-Type':  'application/json',
+              'x-wa-secret':   SECRET_KEY,  // ✅ المفتاح — هذا كان السبب الرئيسي للـ 403
+            }
+          });
 
-          const reply = r.data?.reply || 'عذراً، النظام مشغول.';
+          const reply = r.data?.reply;
+          if (!reply) { console.log('[Bot] No reply from PHP'); continue; }
           if (r.data?.conv_id) sess.conv_id = r.data.conv_id;
-
-          sess.history.push({ role:'user', content:text });
-          sess.history.push({ role:'assistant', content:reply });
-          if (sess.history.length > 12) sess.history = sess.history.slice(-12);
 
           await waSocket.sendMessage(from, { text:reply });
           console.log(`[Bot] Replied to ${phone}`);
 
         } catch(e) {
           console.error('[Bot] Error:', e.message);
-          try { await waSocket.sendMessage(from, { text:'عذراً، النظام مشغول. سنتواصل معك قريباً.' }); } catch(e2){}
+          try { await waSocket.sendMessage(from, { text:'عذراً، حدث خطأ مؤقت. يرجى إعادة المحاولة.' }); } catch(e2){}
         }
 
         try { await waSocket.sendPresenceUpdate('paused', from); } catch(e){}
