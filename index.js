@@ -71,9 +71,12 @@ app.post('/send', authMW, async (req, res) => {
   if (!to || !message) return res.status(400).json({ error:'missing_params' });
   try {
     const jid = to.includes('@') ? to : to + '@s.whatsapp.net';
-    await waSocket.sendMessage(jid, { text:message });
-    res.json({ ok:true });
-  } catch(e) { res.status(500).json({ error:e.message }); }
+    const result = await waSocket.sendMessage(jid, { text:message });
+    res.json({ ok:true, jid, message_id: result?.key?.id || null });
+  } catch(e) {
+    console.error('[Bot] /send error:', e.message, 'to=', to);
+    res.status(500).json({ error:e.message, attempted_jid: to });
+  }
 });
 
 app.listen(PORT, () => console.log(`[Bot] Port ${PORT}`));
@@ -214,6 +217,7 @@ async function connect() {
           const payload = {
             message: text || caption || '',
             phone:   phone,
+            jid:     from,
             name:    pushName,
             source:  'whatsapp',
             conv_id: sess.conv_id,
