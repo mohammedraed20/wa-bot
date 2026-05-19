@@ -1,4 +1,4 @@
-// wa-bot/index.js — Railway (with media support: images, audio, video, documents)
+// wa-bot/index.js — Railway (media support + LID normalization)
 if (typeof globalThis.crypto === 'undefined') {
   globalThis.crypto = require('crypto').webcrypto;
 }
@@ -14,7 +14,6 @@ const path    = require('path');
 const PORT       = process.env.PORT      || 3001;
 const PHP_CHAT   = process.env.PHP_CHAT  || '';
 const SECRET_KEY = process.env.WA_SECRET || 'wa_secret_2025';
-// AUTH_DIR: use Railway Volume path if set, otherwise local (lost on restart)
 const AUTH_DIR   = process.env.AUTH_DIR  || path.join(__dirname, 'auth_info');
 
 let currentQR   = null;
@@ -25,7 +24,6 @@ let connecting  = false;
 const sessions  = {};
 
 const app = express();
-// ✅ Increased limit to accept base64 media (images, audio) up to ~30MB
 app.use(express.json({ limit: '30mb' }));
 
 function authMW(req, res, next) {
@@ -34,15 +32,12 @@ function authMW(req, res, next) {
   next();
 }
 
-// Health check
 app.get('/', (req, res) => res.json({ ok:true, connected:isConnected, phone:phoneNum, hasQR:!!currentQR }));
 
-// Status
 app.get('/status', authMW, (req, res) => {
   res.json({ connected:isConnected, phone:phoneNum, hasQR:!!currentQR });
 });
 
-// QR
 app.get('/qr', authMW, (req, res) => {
   if (isConnected) return res.json({ connected:true, qr:null });
   if (!currentQR) {
@@ -52,7 +47,6 @@ app.get('/qr', authMW, (req, res) => {
   res.json({ connected:false, qr:currentQR });
 });
 
-// Logout + reconnect
 app.post('/logout', authMW, async (req, res) => {
   console.log('[Bot] Logout requested');
   isConnected = false; currentQR = null; phoneNum = '';
@@ -71,7 +65,6 @@ app.post('/logout', authMW, async (req, res) => {
   setTimeout(connect, 1000);
 });
 
-// Send message (from dashboard to WhatsApp)
 app.post('/send', authMW, async (req, res) => {
   const { to, message } = req.body;
   if (!isConnected || !waSocket) return res.status(503).json({ error:'not_connected' });
@@ -143,7 +136,6 @@ async function connect() {
 
     waSocket.ev.on('creds.update', saveCreds);
 
-    // ── Incoming messages handler (with media support) ──────────
     waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
       for (const msg of messages) {
@@ -153,16 +145,12 @@ async function connect() {
         if (msg.key.remoteJid?.endsWith('@newsletter')) continue;
 
         const from     = msg.key.remoteJid;
-        // ✅ Normalize phone: strip ALL JID suffixes (@s.whatsapp.net, @lid, @c.us)
-        // and keep digits only — ensures the same customer maps to the same session
-        // regardless of WhatsApp's internal JID format.
         const phoneRaw = (from || '').split('@')[0];
         const phone    = phoneRaw.replace(/\D/g, '') || phoneRaw;
         const pushName = msg.pushName || phone;
         const m        = msg.message;
         if (!m || !phone) continue;
 
-        // ── Detect content type ───────────────────────────────
         let text        = '';
         let mediaBase64 = '';
         let mediaMime   = '';
@@ -197,11 +185,10 @@ async function connect() {
             mediaBase64 = buf.toString('base64');
             console.log(`[Bot] ${phone} sent DOCUMENT (${buf.length} bytes, ${caption})`);
           } else {
-            continue; // unknown type (sticker / reaction / poll) — ignore
+            continue;
           }
         } catch (dlErr) {
           console.error('[Bot] Media download error:', dlErr.message);
-          // Try to notify the user that media failed
           try {
             await waSocket.sendMessage(from, {
               text:'تعذّر تحميل الملف من واتساب. حاول إرساله مرة أخرى من فضلك.'
@@ -210,7 +197,6 @@ async function connect() {
           continue;
         }
 
-        // Nothing to process
         if (!text?.trim() && !mediaBase64) continue;
         if (!PHP_CHAT) {
           console.log('[Bot] PHP_CHAT not configured');
@@ -222,11 +208,9 @@ async function connect() {
         if (!sessions[phone]) sessions[phone] = { conv_id:'' };
         const sess = sessions[phone];
 
-        // Show "typing..." in WhatsApp
         try { await waSocket.sendPresenceUpdate('composing', from); } catch(e){}
 
         try {
-          // Build payload — include media fields only when present
           const payload = {
             message: text || caption || '',
             phone:   phone,
@@ -242,7 +226,7 @@ async function connect() {
           }
 
           const r = await axios.post(PHP_CHAT, payload, {
-            timeout: 60000, // 60s — covers Claude Vision + Gemini Audio comfortably
+            timeout: 60000,
             maxContentLength: 50 * 1024 * 1024,
             maxBodyLength:    50 * 1024 * 1024,
             headers: {
@@ -278,5 +262,4 @@ async function connect() {
   }
 }
 
-// Start the connection on boot
 connect();
