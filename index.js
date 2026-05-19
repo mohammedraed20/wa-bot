@@ -153,10 +153,14 @@ async function connect() {
         if (msg.key.remoteJid?.endsWith('@newsletter')) continue;
 
         const from     = msg.key.remoteJid;
-        const phone    = from?.replace('@s.whatsapp.net','') || '';
+        // ✅ Normalize phone: strip ALL JID suffixes (@s.whatsapp.net, @lid, @c.us)
+        // and keep digits only — ensures the same customer maps to the same session
+        // regardless of WhatsApp's internal JID format.
+        const phoneRaw = (from || '').split('@')[0];
+        const phone    = phoneRaw.replace(/\D/g, '') || phoneRaw;
         const pushName = msg.pushName || phone;
         const m        = msg.message;
-        if (!m) continue;
+        if (!m || !phone) continue;
 
         // ── Detect content type ───────────────────────────────
         let text        = '';
