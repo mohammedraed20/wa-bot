@@ -1,9 +1,9 @@
-// wa-bot/index.js — Railway
+// wa-bot/index.js — Railway (with media support: images, audio, video, documents)
 if (typeof globalThis.crypto === 'undefined') {
   globalThis.crypto = require('crypto').webcrypto;
 }
 
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const express = require('express');
 const axios   = require('axios');
@@ -25,7 +25,8 @@ let connecting  = false;
 const sessions  = {};
 
 const app = express();
-app.use(express.json());
+// ✅ Increased limit to accept base64 media (images, audio) up to ~30MB
+app.use(express.json({ limit: '30mb' }));
 
 function authMW(req, res, next) {
   const k = req.headers['x-wa-secret'] || req.query.secret;
@@ -70,7 +71,7 @@ app.post('/logout', authMW, async (req, res) => {
   setTimeout(connect, 1000);
 });
 
-// Send message
+// Send message (from dashboard to WhatsApp)
 app.post('/send', authMW, async (req, res) => {
   const { to, message } = req.body;
   if (!isConnected || !waSocket) return res.status(503).json({ error:'not_connected' });
@@ -142,43 +143,107 @@ async function connect() {
 
     waSocket.ev.on('creds.update', saveCreds);
 
+    // ── Incoming messages handler (with media support) ──────────
     waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
       for (const msg of messages) {
         if (msg.key.fromMe) continue;
         if (msg.key.remoteJid === 'status@broadcast') continue;
         if (msg.key.remoteJid?.endsWith('@g.us')) continue;
-        if (msg.key.remoteJid?.endsWith('@newsletter')) continue; // تجاهل القنوات
+        if (msg.key.remoteJid?.endsWith('@newsletter')) continue;
 
         const from     = msg.key.remoteJid;
         const phone    = from?.replace('@s.whatsapp.net','') || '';
         const pushName = msg.pushName || phone;
-        const text     = msg.message?.conversation
-                      || msg.message?.extendedTextMessage?.text
-                      || msg.message?.imageMessage?.caption
-                      || '';
+        const m        = msg.message;
+        if (!m) continue;
 
-        if (!text?.trim() || !PHP_CHAT) continue;
-        console.log(`[Bot] ${phone} (${pushName}): ${text.substring(0,50)}`);
+        // ── Detect content type ───────────────────────────────
+        let text        = '';
+        let mediaBase64 = '';
+        let mediaMime   = '';
+        let caption     = '';
+
+        try {
+          if (m.conversation) {
+            text = m.conversation;
+          } else if (m.extendedTextMessage?.text) {
+            text = m.extendedTextMessage.text;
+          } else if (m.imageMessage) {
+            caption    = m.imageMessage.caption || '';
+            mediaMime  = m.imageMessage.mimetype || 'image/jpeg';
+            const buf  = await downloadMediaMessage(msg, 'buffer', {});
+            mediaBase64 = buf.toString('base64');
+            console.log(`[Bot] ${phone} sent IMAGE (${buf.length} bytes, ${mediaMime})`);
+          } else if (m.audioMessage) {
+            mediaMime  = m.audioMessage.mimetype || 'audio/ogg';
+            const buf  = await downloadMediaMessage(msg, 'buffer', {});
+            mediaBase64 = buf.toString('base64');
+            console.log(`[Bot] ${phone} sent AUDIO (${buf.length} bytes, ${mediaMime})`);
+          } else if (m.videoMessage) {
+            caption    = m.videoMessage.caption || '';
+            mediaMime  = m.videoMessage.mimetype || 'video/mp4';
+            const buf  = await downloadMediaMessage(msg, 'buffer', {});
+            mediaBase64 = buf.toString('base64');
+            console.log(`[Bot] ${phone} sent VIDEO (${buf.length} bytes)`);
+          } else if (m.documentMessage) {
+            caption    = m.documentMessage.fileName || '';
+            mediaMime  = m.documentMessage.mimetype || 'application/octet-stream';
+            const buf  = await downloadMediaMessage(msg, 'buffer', {});
+            mediaBase64 = buf.toString('base64');
+            console.log(`[Bot] ${phone} sent DOCUMENT (${buf.length} bytes, ${caption})`);
+          } else {
+            continue; // unknown type (sticker / reaction / poll) — ignore
+          }
+        } catch (dlErr) {
+          console.error('[Bot] Media download error:', dlErr.message);
+          // Try to notify the user that media failed
+          try {
+            await waSocket.sendMessage(from, {
+              text:'تعذّر تحميل الملف من واتساب. حاول إرساله مرة أخرى من فضلك.'
+            });
+          } catch(e2){}
+          continue;
+        }
+
+        // Nothing to process
+        if (!text?.trim() && !mediaBase64) continue;
+        if (!PHP_CHAT) {
+          console.log('[Bot] PHP_CHAT not configured');
+          continue;
+        }
+
+        console.log(`[Bot] ${phone} (${pushName}): ${text?.substring(0,50) || '[media-only]'}`);
 
         if (!sessions[phone]) sessions[phone] = { conv_id:'' };
         const sess = sessions[phone];
 
+        // Show "typing..." in WhatsApp
         try { await waSocket.sendPresenceUpdate('composing', from); } catch(e){}
 
         try {
-          const r = await axios.post(PHP_CHAT, {
-            message: text,
-            phone:   phone,       // ✅ رقم العميل
-            name:    pushName,    // ✅ اسم العميل
+          // Build payload — include media fields only when present
+          const payload = {
+            message: text || caption || '',
+            phone:   phone,
+            name:    pushName,
             source:  'whatsapp',
             conv_id: sess.conv_id,
-            id:      msg.key.id,  // ✅ deduplication
-          }, {
-            timeout: 35000,
+            id:      msg.key.id,
+          };
+          if (mediaBase64) {
+            payload.media_base64 = mediaBase64;
+            payload.media_mime   = mediaMime;
+            payload.caption      = caption;
+          }
+
+          const r = await axios.post(PHP_CHAT, payload, {
+            timeout: 60000, // 60s — covers Claude Vision + Gemini Audio comfortably
+            maxContentLength: 50 * 1024 * 1024,
+            maxBodyLength:    50 * 1024 * 1024,
             headers: {
               'Content-Type':  'application/json',
-              'x-wa-secret':   SECRET_KEY,  // ✅ المفتاح — هذا كان السبب الرئيسي للـ 403
+              'x-wa-secret':   SECRET_KEY,
             }
           });
 
@@ -187,11 +252,15 @@ async function connect() {
           if (r.data?.conv_id) sess.conv_id = r.data.conv_id;
 
           await waSocket.sendMessage(from, { text:reply });
-          console.log(`[Bot] Replied to ${phone}`);
+          console.log(`[Bot] Replied to ${phone} (${reply.length} chars)`);
 
         } catch(e) {
-          console.error('[Bot] Error:', e.message);
-          try { await waSocket.sendMessage(from, { text:'عذراً، حدث خطأ مؤقت. يرجى إعادة المحاولة.' }); } catch(e2){}
+          console.error('[Bot] Error calling PHP:', e.message);
+          try {
+            await waSocket.sendMessage(from, {
+              text:'عذراً، حدث خطأ مؤقت. يرجى إعادة المحاولة.'
+            });
+          } catch(e2){}
         }
 
         try { await waSocket.sendPresenceUpdate('paused', from); } catch(e){}
@@ -205,5 +274,5 @@ async function connect() {
   }
 }
 
-// بدء الاتصال عند التشغيل
+// Start the connection on boot
 connect();
